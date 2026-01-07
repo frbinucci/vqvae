@@ -6,6 +6,48 @@ import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class GaussianIBVectorQuantizer(nn.Module):
+    def __init__(self, n_e, e_dim, beta):
+        super().__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        print(self.n_e)
+        self.beta = beta
+        self.embedding = nn.Embedding(n_e, e_dim)
+        self.embedding.weight.data.uniform_(-1.0 / n_e, 1.0 / n_e)
+
+    def forward(self, z):
+        # z: [B, D]
+        assert z.dim() == 2 and z.size(1) == self.e_dim, f"z={z.shape}, e_dim={self.e_dim}"
+
+        # distances: [B, n_e]
+        d = (z.pow(2).sum(1, keepdim=True)
+             + self.embedding.weight.pow(2).sum(1)
+             - 2 * z @ self.embedding.weight.t())
+
+        indices = torch.argmin(d, dim=1)  # [B] long
+        enc = F.one_hot(indices, num_classes=self.n_e).type_as(z)  # [B, n_e]
+
+        z_q = self.embedding(indices)     # [B, D]
+
+        # VQ-VAE standard (ordine corretto)
+        codebook_loss   = (z_q - z.detach()).pow(2).mean()
+        commitment_loss = self.beta * (z - z_q.detach()).pow(2).mean()
+        loss = codebook_loss + commitment_loss
+
+        # straight-through
+        z_q = z + (z_q - z).detach()
+
+        # perplexity
+        e_mean = enc.mean(0)
+        perplexity = torch.exp(-(e_mean * (e_mean + 1e-10).log()).sum())
+
+        tau = 0.5
+        p = torch.softmax(-d / tau, dim=1)  # tau > 0 (es. 0.5 -> 1.0)
+        p_mean = p.mean(dim=0)  # [n_e]
+        H_soft = -(p_mean * (p_mean + 1e-10).log()).sum()  # nats, differenziabile
+
+        return loss, z_q, perplexity, enc, indices,H_soft
 
 class VectorQuantizer(nn.Module):
     """

@@ -5,6 +5,28 @@ import torch.nn.functional as F
 import numpy as np
 from models.residual import ResidualStack
 
+class GaussianIBEncoder(nn.Module):
+    def __init__(self, in_dim, h_dim, init_log_var=-2.0):
+        super().__init__()
+        # mean: linear
+        self.mu = nn.Linear(in_dim, h_dim, bias=True)
+
+        # diag covariance (constant, learnable): log_var is a parameter vector
+        self.log_var = nn.Parameter(torch.ones(h_dim) * init_log_var)
+
+    def forward(self, x, sample=False):
+
+        mu = self.mu(x)  # [B, h_dim]
+        log_var = self.log_var.unsqueeze(0).expand_as(mu)  # [B, h_dim]
+
+        if not sample:
+            return mu, log_var, mu  # z = mu (no sampling)
+
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return mu, log_var, z
+
 
 class Encoder(nn.Module):
     """
@@ -42,7 +64,6 @@ class Encoder(nn.Module):
     def forward(self, x):
         return self.conv_stack(x)
 
-
 if __name__ == "__main__":
     # random data
     x = np.random.random_sample((3, 40, 40, 200))
@@ -52,3 +73,4 @@ if __name__ == "__main__":
     encoder = Encoder(40, 128, 3, 64)
     encoder_out = encoder(x)
     print('Encoder out shape:', encoder_out.shape)
+

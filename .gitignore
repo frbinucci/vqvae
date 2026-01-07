@@ -1,8 +1,15 @@
 data/
 __pycache__
+*.py[cod]
+*$py.class
+
+.venv/
+.idea/ 
 .vscode/
 **.swp 
 playground*
 results/
 .ipynb_checkpoints/
 samples/
+
+regression_test.py

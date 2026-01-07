@@ -5,6 +5,28 @@ import torch.nn.functional as F
 import numpy as np
 from models.residual import ResidualStack
 
+class GaussianIBDecoder(nn.Module):
+    """
+    This is the p_phi (x|z) network. Given a latent sample z p_phi
+    maps back to the original space z -> x.
+
+    Inputs:
+    - in_dim : the input dimension
+    - h_dim : the hidden layer dimension
+    - res_h_dim : the hidden dimension of the residual block
+    - n_res_layers : number of layers to stack
+
+    """
+
+    def __init__(self, out_dim, h_dim):
+        super(GaussianIBDecoder, self).__init__()
+
+        self.decoding_stack = nn.Sequential(
+            nn.Linear(h_dim,2*out_dim)
+        )
+
+    def forward(self, x):
+        return self.decoding_stack(x)
 
 class Decoder(nn.Module):
     """
