@@ -10,3 +10,4 @@ six
 torch
 opencv-python
 torchvision
+scipy
