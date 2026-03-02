@@ -3,9 +3,10 @@ from keyword import kwlist
 import torch
 import torch.nn as nn
 import numpy as np
-from models.encoder import Encoder, GaussianIBEncoder
-from models.quantizer import VectorQuantizer, GaussianIBVectorQuantizer
-from models.decoder import Decoder, GaussianIBDecoder
+from models.encoder import Encoder, GaussianIBEncoder, TokenizedGaussianIBEncoder
+from models.quantizer import VectorQuantizer, GaussianIBVectorQuantizer, TokenVQ
+from models.decoder import Decoder, GaussianIBDecoder, GaussianRegressionDecoder
+from thop import profile, clever_format
 
 
 class VQVAE(nn.Module,):
@@ -17,10 +18,16 @@ class VQVAE(nn.Module,):
         self.skip_quantization = skip_quantization
 
         if quantizer_type=='shallow':
-            self.encoder = GaussianIBEncoder(in_dim,h_dim)
+            print("==================================================================================")
+            print(f'n_z = {h_dim} tokens x {embedding_dim} features = {h_dim*embedding_dim} features')
+            print(f'N_b = {np.log2(n_embeddings)*h_dim} bits')
+            self.encoder = TokenizedGaussianIBEncoder(in_dim,h_dim,embedding_dim)
             self.pre_quantization_conv = nn.Identity()
-            self.vector_quantization = GaussianIBVectorQuantizer(n_embeddings, h_dim, beta)  # <-- FIX
-            self.decoder = GaussianIBDecoder(out_dim,h_dim)
+            self.vector_quantization = TokenVQ(n_embeddings, embedding_dim, beta)  # <-- FIX
+            self.decoder = GaussianRegressionDecoder(out_dim,h_dim,embedding_dim)
+            macs = profile(self.encoder,inputs=(torch.randn(1,1,in_dim)))
+            print(f'Encoder complexity = {macs}')
+            print("==================================================================================")
         elif quantizer_type=='convolutional':
             self.encoder = Encoder(3, h_dim, n_res_layers, res_h_dim)
             self.pre_quantization_conv = nn.Conv2d(
@@ -50,8 +57,8 @@ class VQVAE(nn.Module,):
             z_e = mu if deterministic else z
             z_e = self.pre_quantization_conv(z_e)
 
-            embedding_loss, z_q, perplexity, _, indices,H_soft = self.vector_quantization(z_e)
-            out = self.decoder(z_q)
+            embedding_loss, z_q, perplexity, indices,H_soft = self.vector_quantization(z_e)
+            out,log_var = self.decoder(z_q)
 
 
 
@@ -61,4 +68,4 @@ class VQVAE(nn.Module,):
             print('recon data shape:', out.shape)
             assert False
 
-        return embedding_loss, out, perplexity, indices,H_soft
+        return embedding_loss, out, perplexity, indices,H_soft,log_var

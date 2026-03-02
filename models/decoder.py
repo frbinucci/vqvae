@@ -5,6 +5,36 @@ import torch.nn.functional as F
 import numpy as np
 from models.residual import ResidualStack
 
+class GaussianRegressionDecoder(nn.Module):
+    """
+    Predicts Y given quantized tokens.
+      z_q: [B, M, D] -> flatten -> [B, M*D] -> outputs [B, 2*out_dim]
+    Interpreted as (mu_y, log_var_y).
+    """
+    def __init__(self, out_dim: int, n_tokens: int, token_dim: int, hidden: int = None):
+        super().__init__()
+        in_dim = n_tokens * token_dim
+        hidden = hidden or (2 * in_dim)
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2 * out_dim)
+        )
+
+    def forward(self, z_q: torch.Tensor):
+        B, M, D = z_q.shape
+        h = z_q.reshape(B, M * D)
+        out = self.net(h)
+        mu_y, log_var_y = out.chunk(2, dim=1)
+        return mu_y, log_var_y
+
+
+def gaussian_nll(y, mu, log_var):
+    # y, mu, log_var: [B, out_dim]
+    # per-dimension Gaussian NLL (up to constant)
+    return 0.5 * (log_var + (y - mu).pow(2) / torch.exp(log_var)).mean()
+
 class GaussianIBDecoder(nn.Module):
     """
     This is the p_phi (x|z) network. Given a latent sample z p_phi

@@ -57,8 +57,8 @@ def plot_random_vectors(model, loader, device, n_plot=5, seed=0,
     y = torch.cat(ys, dim=0).to(device)
 
     # forward (adatta i flag se il tuo forward li supporta)
-    out = model(x, deterministic=deterministic, skip_quantization=skip_quantization)[1]
-    mu, _ = out.chunk(2, dim=-1)  # mu: [n_plot, ny]
+    mu = model(x, deterministic=deterministic, skip_quantization=skip_quantization)[1]
+    #mu, _ = out.chunk(2, dim=-1)  # mu: [n_plot, ny]
 
     y_cpu = y.detach().cpu()
     mu_cpu = mu.detach().cpu()
@@ -80,48 +80,185 @@ def plot_random_vectors(model, loader, device, n_plot=5, seed=0,
         model.train()
 
 
+import numpy as np
+
+def make_gaussian_hard_case_for_gib(
+    n_samples=int(1e5),
+    n_features=25,
+    y_dim=3,
+    k_strong=4,          # fattori molto rilevanti per Y
+    m_weak=8,            # fattori debolmente rilevanti ma ad alta varianza
+    scale_strong=0.6,    # std del blocco "forte"
+    scale_weak=6,      # std del blocco "debole" (molto più grande!)
+    scale_noise=1.0,     # std del rumore irrilevante su X
+    gamma_weak=0.15,     # quanto i fattori W entrano in Y (piccolo ma NON zero)
+    snr_y=5.0,          # SNR di Y rispetto alla parte pulita (più alto = Y più predicibile)
+    rotate=True,
+    train_frac=0.8,
+    shuffle=True,
+    seed=0,
+):
+    """
+    Restituisce: Xtr, Ytr, Xte, Yte, info
+    con X gaussiane e Y multidimensionale (joint Gaussian).
+
+    Shapes:
+      Xtr: (n_tr, n_features)
+      Ytr: (n_tr, y_dim)
+      Xte: (n_te, n_features)
+      Yte: (n_te, y_dim)
+    """
+    rng = np.random.default_rng(seed)
+
+    n = int(n_features)
+    k = int(k_strong)
+    m = int(m_weak)
+    d = int(y_dim)
+    r = n - k - m
+    if r < 0:
+        raise ValueError("Serve n_features >= k_strong + m_weak.")
+
+    if not (0.0 < train_frac < 1.0):
+        raise ValueError("train_frac deve essere tra 0 e 1.")
+
+    # Latenti gaussiani
+    U = rng.standard_normal((n_samples, k))
+    W = rng.standard_normal((n_samples, m))
+    V = rng.standard_normal((n_samples, r)) if r > 0 else None
+
+    # X prima della rotazione: [forte, debole, irrilevante]
+    parts = [scale_strong * U, scale_weak * W]
+    if r > 0:
+        parts.append(scale_noise * V)
+    X0 = np.concatenate(parts, axis=1)  # (n_samples, n_features)
+
+    # Rotazione ortogonale per mischiare le dimensioni (mantiene gaussianità)
+    Q = None
+    if rotate:
+        Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
+        X = X0 @ Q
+    else:
+        X = X0
+
+    # Y multidimensionale: forte da U + debole da W + rumore
+    Bu = rng.standard_normal((k, d))
+    Bw = rng.standard_normal((m, d))
+
+    Y_clean = (U @ Bu) + gamma_weak * (W @ Bw)  # (n_samples, y_dim)
+
+    # Rumore su Y fissato da snr_y (per-dimensione, cov diagonale)
+    var_clean = np.var(Y_clean, axis=0, ddof=1)           # (y_dim,)
+    var_noise = var_clean / float(snr_y)
+    noise = rng.standard_normal((n_samples, d)) * np.sqrt(var_noise + 1e-18)
+    Y = Y_clean + noise
+
+    # Split train/test
+    idx = np.arange(n_samples)
+    if shuffle:
+        rng.shuffle(idx)
+
+    n_tr = int(np.floor(train_frac * n_samples))
+    tr_idx = idx[:n_tr]
+    te_idx = idx[n_tr:]
+
+    Xtr, Ytr = X[tr_idx], Y[tr_idx]
+    Xte, Yte = X[te_idx], Y[te_idx]
+
+    info = {
+        "Q": Q,
+        "Bu": Bu,
+        "Bw": Bw,
+        "k_strong": k,
+        "m_weak": m,
+        "scale_strong": scale_strong,
+        "scale_weak": scale_weak,
+        "scale_noise": scale_noise,
+        "gamma_weak": gamma_weak,
+        "snr_y": snr_y,
+        "rotate": rotate,
+        "train_frac": train_frac,
+        "seed": seed,
+    }
+    return Xtr, Ytr, Xte, Yte, info
+
+
+
 def load_gaussian_xy(**kwargs):
-    seed = kwargs.get("seed", 0)
-    np.random.seed(seed)
-    g = torch.Generator().manual_seed(seed)
+    seed = kwargs.get("seed", 1)
+    rng = np.random.default_rng(seed)
 
     n_samples = kwargs.get("n_samples", int(1e5))
     train_ratio = kwargs.get("train_ratio", 0.8)
     nx = kwargs.get("nx", 10)
     ny = kwargs.get("ny", 5)
-    dtype = kwargs.get("dtype", torch.float32)
+    dtype = kwargs.get("dtype", np.float32)
 
-    # controlli principali
-    nmse_db_target = kwargs.get("nmse_db_target", -10.0)   # es: -3.5, -10, -20...
-    rank = kwargs.get("rank", min(nx, ny))                 # puoi metterlo <= bottleneck (es 10)
+    nmse_db_target = kwargs.get("nmse_db_target", -20)  # dB
+    rank = int(min(kwargs.get("rank", min(nx, ny)), nx, ny))
+    if rank <= 0:
+        raise ValueError("rank deve essere >= 1")
 
     # X ~ N(0, I)
-    X = torch.randn(n_samples, nx, generator=g, dtype=dtype)
+    X = rng.standard_normal((n_samples, nx)).astype(dtype, copy=False)
 
-    # A con rango controllato (ny x nx)
-    U = torch.randn(ny, rank, generator=g, dtype=dtype)
-    V = torch.randn(rank, nx, generator=g, dtype=dtype)
-    A = (U @ V) / math.sqrt(rank)   # scala “ragionevole”
+    # A with controlled rank (ny x nx)
+    U = rng.standard_normal((ny, rank)).astype(dtype, copy=False)
+    V = rng.standard_normal((rank, nx)).astype(dtype, copy=False)
+    A = (U @ V) / math.sqrt(rank)  # (ny x nx)
 
-    # segnale pulito
-    Y0 = X @ A.t()  # [N, ny]
+    # clean signal
+    Y0 = X @ A.T  # (N, ny)
 
-    # scegli sigma^2 per ottenere NMSE target (globale)
-    nmse_target = 10 ** (nmse_db_target / 10.0)  # attenzione: db -> ratio
-    sig_power = (Y0.pow(2).sum(dim=1)).mean().item()  # E||Y0||^2
-    # Vogliamo: E||eps||^2 / E||Y0+eps||^2 = nmse_target circa
-    # Con eps ~ N(0, sigma^2 I): E||eps||^2 = ny * sigma^2
-    sigma2 = (nmse_target / max(1e-12, (1.0 - nmse_target))) * (sig_power / ny)
+    # choose sigma^2 to hit global NMSE target
+    nmse_target = 10.0 ** (nmse_db_target / 10.0)
 
-    eps = torch.randn(Y0.shape, generator=g, device=Y0.device, dtype=Y0.dtype) * math.sqrt(sigma2)
+    sig_power = np.mean(np.sum(Y0 * Y0, axis=1)).item()  # E||Y0||^2
+
+    # Want: E||eps||^2 / E||Y0+eps||^2 = nmse_target
+    # E||eps||^2 = ny * sigma^2
+    denom = max(1e-12, (1.0 - nmse_target))
+    sigma2 = (nmse_target / denom) * (sig_power / ny)
+
+    eps = rng.standard_normal(Y0.shape).astype(dtype, copy=False) * math.sqrt(sigma2)
     Y = Y0 + eps
 
-    dataset = TensorDataset(X, Y)
+    # split
     n_train = int(train_ratio * n_samples)
-    n_val = n_samples - n_train
-    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
+    x_train = X[:n_train, :]
+    y_train = Y[:n_train, :]
+    x_test  = X[n_train:, :]
+    y_test  = Y[n_train:, :]
 
-    return train_ds, val_ds, torch.trace(torch.eye(nx, dtype=dtype))  # o altro se ti serve
+    # ---- TRUE (population) covariance matrices from the generative model ----
+    I_x = np.eye(nx, dtype=dtype)
+    I_y = np.eye(ny, dtype=dtype)
+
+    cov_xx_true = I_x
+    cov_yy_true = (A @ A.T).astype(dtype, copy=False) + (sigma2 * I_y)
+    cov_xy_true = A.T.astype(dtype, copy=False)   # shape (nx, ny)
+    cov_yx_true = A.astype(dtype, copy=False)     # shape (ny, nx)
+
+    cov_joint_true = np.block([
+        [cov_xx_true, cov_xy_true],
+        [cov_yx_true, cov_yy_true],
+    ]).astype(dtype, copy=False)
+
+    cov_true = {
+        "cov_xx": cov_xx_true,
+        "cov_yy": cov_yy_true,
+        "cov_xy": cov_xy_true,
+        "cov_yx": cov_yx_true,
+        "cov_joint": cov_joint_true,
+        "A": A.astype(dtype, copy=False),
+        "sigma2": float(sigma2),
+    }
+
+    #return x_train, y_train, x_test, y_test, cov_true
+    print(nx)
+    training_set = TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train))
+    test_set = TensorDataset(torch.from_numpy(x_test), torch.from_numpy(y_test))
+
+    return training_set, test_set#, torch.trace(torch.eye(nx, dtype=dtype))  # o altro se ti serve
 
 def load_cifar():
     train = datasets.CIFAR10(root="data", train=True, download=True,
@@ -209,16 +346,16 @@ def load_data_and_data_loaders(dataset, batch_size,**kwargs):
     elif dataset=='MULTIVARIATE_GAUSSIAN':
         nx = kwargs.get('nx',None)
         ny = kwargs.get('ny',None)
-        training_data, validation_data,y_var = load_gaussian_xy(nx = nx,ny = ny)
+        training_data, validation_data = load_gaussian_xy(nx = nx,ny = ny)
         training_loader, validation_loader = data_loaders(
             training_data, validation_data, batch_size)
-        x_train_var =y_var
+        #x_train_var =y_var
 
     else:
         raise ValueError(
             'Invalid dataset: only CIFAR10 and BLOCK datasets are supported.')
 
-    return training_data, validation_data, training_loader, validation_loader, x_train_var
+    return training_data, validation_data, training_loader, validation_loader#, x_train_var
 
 
 def readable_timestamp():
@@ -232,8 +369,11 @@ def fingerprint(model):
     return h.hexdigest()[:16]
 
 
-def save_model_and_results(model, results, hyperparameters, timestamp):
-    SAVE_MODEL_PATH = os.getcwd() + '/results'
+def save_model_and_results(model, results, hyperparameters, timestamp,output_dir):
+    SAVE_MODEL_PATH = os.getcwd() + '/results'+output_dir
+
+    if not os.path.exists(SAVE_MODEL_PATH):
+        os.makedirs(SAVE_MODEL_PATH,exist_ok=True)
 
     results_to_save = {
         'model': model.state_dict(),
@@ -241,4 +381,4 @@ def save_model_and_results(model, results, hyperparameters, timestamp):
         'hyperparameters': hyperparameters
     }
     torch.save(results_to_save,
-               SAVE_MODEL_PATH + '/vqvae_data_' + timestamp + '.pth')
+               SAVE_MODEL_PATH + '/vqvae_data'+'.pth')

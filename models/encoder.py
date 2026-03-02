@@ -5,6 +5,43 @@ import torch.nn.functional as F
 import numpy as np
 from models.residual import ResidualStack
 
+class TokenizedGaussianIBEncoder(nn.Module):
+    """
+    Deterministic encoder producing M tokens of dimension D:
+      x: [B, in_dim]  ->  z_e: [B, M, D]
+    """
+    def __init__(self, in_dim: int, n_tokens: int, token_dim: int, init_log_var: float = -2.0):
+        super().__init__()
+        self.in_dim = in_dim
+        self.n_tokens = n_tokens
+        self.token_dim = token_dim
+        self.h_dim = n_tokens * token_dim
+
+        # mean: linear -> produces M*D numbers
+        self.mu = nn.Linear(in_dim, self.h_dim, bias=True)
+
+        # (optional) diag covariance, constant learnable. Not used in VQ-VAE deterministic mode.
+        self.log_var = nn.Parameter(torch.ones(self.h_dim) * init_log_var)
+
+
+    def forward(self, x, sample: bool = False):
+        mu = self.mu(x)  # [B, M*D]
+        log_var = self.log_var.unsqueeze(0).expand_as(mu)  # [B, M*D]
+
+        if sample:
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            z = mu + eps * std  # [B, M*D]
+        else:
+            z = mu  # deterministic, VQ-VAE-style
+
+        # tokenize: [B, M, D]
+        z_tokens = z.view(z.size(0), self.n_tokens, self.token_dim)
+        mu_tokens = mu.view(mu.size(0), self.n_tokens, self.token_dim)
+        log_var_tokens = log_var.view(log_var.size(0), self.n_tokens, self.token_dim)
+
+        return mu_tokens, log_var_tokens, z_tokens
+
 class GaussianIBEncoder(nn.Module):
     def __init__(self, in_dim, h_dim, init_log_var=-2.0):
         super().__init__()
